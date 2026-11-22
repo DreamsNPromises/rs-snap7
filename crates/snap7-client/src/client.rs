@@ -363,8 +363,10 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send> S7Client<T> {
         }
 
         // PDU size constants (in bytes)
-        // S7 header: 10, func+count: 2, per-item address: 12
+        // Request header: 10, ACK_DATA response header: 12 (adds error class/code,
+        // cf. snap7 TS7ResHeader23, sizeof = 12), func+count: 2, per-item address: 12
         const S7_HEADER: usize = 10;
+        const S7_ACK_HEADER: usize = 12; // ACK_DATA carries error class/code
         const PARAM_OVERHEAD: usize = 2; // func + item count
         const ADDR_ITEM_SIZE: usize = 12;
         // Response data item: 4 header + data + 0/1 pad
@@ -374,7 +376,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send> S7Client<T> {
         let mut inner = self.inner.lock().await;
         let pdu_size = inner.connection.pdu_size as usize;
         let max_req_payload = pdu_size.saturating_sub(S7_HEADER + PARAM_OVERHEAD);
-        let max_resp_payload = pdu_size.saturating_sub(S7_HEADER + PARAM_OVERHEAD);
+        let max_resp_payload = pdu_size.saturating_sub(S7_ACK_HEADER + PARAM_OVERHEAD);
 
         let mut results = vec![Bytes::new(); items.len()];
         let mut batch_start = 0;
@@ -2797,7 +2799,7 @@ mod tests {
 
     /// Items are split into two round trips when response would exceed the negotiated PDU size.
     ///
-    /// PDU = 64 bytes. max_resp_payload = 64 - 10(hdr) - 2(func+count) = 52 bytes.
+    /// PDU = 64 bytes. max_resp_payload = 64 - 12(ack hdr) - 2(func+count) = 50 bytes.
     /// Each item with 30 bytes of data costs 4+30 = 34 bytes in the response.
     /// Two such items = 68 bytes → exceeds 52 → must split into 2 round trips.
     #[tokio::test]
@@ -2869,6 +2871,105 @@ mod tests {
         assert_eq!(results.len(), 2);
         assert_eq!(&results[0][..], &[0x11u8; 30][..]);
         assert_eq!(&results[1][..], &[0x22u8; 30][..]);
+    }
+
+    /// The response budget must account for the 12-byte ACK_DATA header
+    /// (error class + code), not the 10-byte request header.
+    ///
+    /// PDU = 240 bytes. max_resp_payload = 240 - 12(ack hdr) - 2(func+count) = 226.
+    /// Items of 202 and 18 bytes cost 4+202 = 206 and 4+18 = 22 in the response,
+    /// sum = 232 > 226 → must split into 2 round trips. With the buggy
+    /// 10-byte header budget (228): 228 <= 228, the sum would fit in one batch.
+    #[tokio::test]
+    async fn read_multi_vars_uses_ack_header_in_response_budget() {
+        use crate::proto::s7::negotiate::NegotiateResponse;
+
+        let req_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let req_count_srv = req_count.clone();
+
+        async fn mock_ack_budget(
+            mut server_io: tokio::io::DuplexStream,
+            req_count: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        ) {
+            let mut buf = vec![0u8; 65536];
+
+            // COTP CR
+            let _ = server_io.read(&mut buf).await;
+            let cc = CotpPdu::ConnectConfirm { dst_ref: 1, src_ref: 1 };
+            let mut cb = BytesMut::new(); cc.encode(&mut cb);
+            let mut tb = BytesMut::new();
+            TpktFrame { payload: cb.freeze() }.encode(&mut tb).unwrap();
+            server_io.write_all(&tb).await.unwrap();
+
+            // Negotiate — PDU size 240
+            let _ = server_io.read(&mut buf).await;
+            let neg = NegotiateResponse {
+                max_amq_calling: 1, max_amq_called: 1, pdu_length: 240,
+            };
+            let mut s7b = BytesMut::new();
+            S7Header {
+                pdu_type: PduType::AckData, reserved: 0, pdu_ref: 1,
+                param_len: 8, data_len: 0, error_class: Some(0), error_code: Some(0),
+            }.encode(&mut s7b);
+            neg.encode(&mut s7b);
+            let dt = CotpPdu::Data { tpdu_nr: 0, last: true, payload: s7b.freeze() };
+            let mut cb = BytesMut::new(); dt.encode(&mut cb);
+            let mut tb = BytesMut::new();
+            TpktFrame { payload: cb.freeze() }.encode(&mut tb).unwrap();
+            server_io.write_all(&tb).await.unwrap();
+
+            // Answer each request with as many data items as it contained
+            let data: &[&[u8]] = &[&[0x11u8; 202], &[0x22u8; 18]];
+            let mut pdu_ref = 2;
+            loop {
+                let n = server_io.read(&mut buf).await.unwrap();
+                if n == 0 { break; }
+                // Request layout: TPKT(4) + COTP Data(3) + S7 header(10) + func(1) + count(1)
+                let items_count = buf[18] as usize;
+                req_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let round = pdu_ref - 2;
+                let mut s7b = BytesMut::new();
+                s7b.extend_from_slice(&[0x04, items_count as u8]);
+                let mut data_len = 0usize;
+                for item in &data[round..round + items_count] {
+                    let bit_len = (item.len() * 8) as u16;
+                    s7b.put_u8(0xFF);
+                    s7b.put_u8(0x04);
+                    s7b.put_u16(bit_len);
+                    s7b.extend_from_slice(item);
+                    if item.len() % 2 != 0 { s7b.put_u8(0x00); }
+                    data_len += 4 + item.len() + (item.len() % 2);
+                }
+                let mut s7h = BytesMut::new();
+                S7Header {
+                    pdu_type: PduType::AckData, reserved: 0, pdu_ref: pdu_ref as u16,
+                    param_len: 2, data_len: data_len as u16,
+                    error_class: Some(0), error_code: Some(0),
+                }.encode(&mut s7h);
+                let mut frame = BytesMut::new();
+                frame.extend_from_slice(&s7h);
+                frame.extend_from_slice(&s7b);
+                let dt = CotpPdu::Data { tpdu_nr: 0, last: true, payload: frame.freeze() };
+                let mut cb = BytesMut::new(); dt.encode(&mut cb);
+                let mut tb = BytesMut::new();
+                TpktFrame { payload: cb.freeze() }.encode(&mut tb).unwrap();
+                server_io.write_all(&tb).await.unwrap();
+                pdu_ref += 1;
+            }
+        }
+
+        let (client_io, server_io) = duplex(65536);
+        let params = ConnectParams::default();
+        tokio::spawn(mock_ack_budget(server_io, req_count_srv));
+        let client = S7Client::from_transport(client_io, params).await.unwrap();
+
+        let items = [MultiReadItem::db(1, 0, 202), MultiReadItem::db(2, 0, 18)];
+        let results = client.read_multi_vars(&items).await.unwrap();
+        // 202 and 22 must land in separate batches: 206 + 22 = 228 > 226
+        assert_eq!(req_count.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert_eq!(results.len(), 2);
+        assert_eq!(&results[0][..], &[0x11u8; 202][..]);
+        assert_eq!(&results[1][..], &[0x22u8; 18][..]);
     }
 
     // -- PLC control & status mocks & tests -----------------------------------
